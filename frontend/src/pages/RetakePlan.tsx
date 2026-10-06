@@ -1,4 +1,4 @@
-/** /retakes 补录计划与结构版本导出：本地库版本查看与 JSON 导入导出 */
+/** /retakes 补录计划与结构版本导出：补录安排与场次抢同一本棚时段账 */
 import { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
@@ -24,13 +24,13 @@ import EmptyPanel from '@/components/common/EmptyPanel';
 import TakeBadge from '@/components/common/TakeBadge';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useProjectStore } from '@/stores/projectStore';
+import { useRetakeStore } from '@/stores/retakeStore';
 import {
   db,
   countAll,
   exportSnapshot,
   importSnapshot,
   resetDatabase,
-  updateRetake,
   completeRetake,
   putRetake,
   removeRetake,
@@ -43,9 +43,25 @@ import {
   type TakeRow
 } from '@/utils/db';
 import { RETAKE_STATES, createEmptyRetake, type Retake } from '@/types/retake';
+import { SESSION_PERIODS, STUDIO_ROOMS } from '@/types/session';
+import { getRoomConfig } from '@/types/room';
 import { buildRow } from '@/hooks/useIdbTable';
 import { buildSessionSheet, downloadJson, parseSheet, serializeSheet, type SessionSheet } from '@/utils/export';
 import { formatDuration, totalDuration } from '@/utils/timecode';
+import {
+  countMusicians,
+  describeShortages,
+  evaluateBooking,
+  retakeToEntry,
+  sessionToEntry
+} from '@/utils/ledger';
+
+const RETAKE_STATE_COLOR: Record<Retake['state'], string> = {
+  待安排: 'orange',
+  待排: 'red',
+  已排期: 'blue',
+  已完成: 'green'
+};
 
 export default function RetakePlan() {
   const retakes = useIdbTable<RetakeRow>(db.retakes);
@@ -55,11 +71,17 @@ export default function RetakePlan() {
   const takes = useIdbTable<TakeRow>(db.takes);
   const currentProjectId = useProjectStore((state) => state.currentProjectId);
 
+  const saveDraft = useRetakeStore((state) => state.saveDraft);
+  const editDraft = useRetakeStore((state) => state.editDraft);
+  const arrange = useRetakeStore((state) => state.arrange);
+  const release = useRetakeStore((state) => state.release);
+
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<RetakeRow | null>(null);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [sheet, setSheet] = useState<SessionSheet | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<Omit<Retake, 'id'>>(createEmptyRetake());
   const [form] = Form.useForm<Omit<Retake, 'id'>>();
 
   useEffect(() => {
@@ -92,35 +114,94 @@ export default function RetakePlan() {
     [takes]
   );
 
+  /** 表单草稿的抢账预览（编辑时排除自身） */
+  const bookingPreview = useMemo(() => {
+    if (!dialogOpen) return null;
+    if (draft.state === '已完成') return { mode: 'done' as const };
+    const entries = [...sessions.map(sessionToEntry), ...retakes.map(retakeToEntry)];
+    const result = evaluateBooking(
+      entries,
+      {
+        date: draft.planDate,
+        period: draft.period,
+        roomNo: draft.roomNo,
+        musicianCount: countMusicians(draft.musicians)
+      },
+      editing?.id ?? null
+    );
+    const room = getRoomConfig(draft.roomNo);
+    return { mode: 'booking' as const, result, room, musicianCount: countMusicians(draft.musicians) };
+  }, [dialogOpen, draft, sessions, retakes, editing]);
+
   const totals = useMemo(() => {
     const pending = scopedRetakes.filter((item) => item.state !== '已完成').length;
+    const waiting = scopedRetakes.filter((item) => item.state === '待排').length;
+    const scheduled = scopedRetakes.filter((item) => item.state === '已排期').length;
     const openTakeDuration = totalDuration(
       problemTakes.map((take) => ({ startTc: take.startTc, endTc: take.endTc }))
     );
     return {
       total: scopedRetakes.length,
       pending,
+      waiting,
+      scheduled,
       done: scopedRetakes.filter((item) => item.state === '已完成').length,
       problemTakes: problemTakes.length,
       openDurationText: formatDuration(openTakeDuration)
     };
   }, [scopedRetakes, problemTakes]);
 
-  async function submit(): Promise<void> {
-    const values = await form.validateFields();
-    if (editing) {
-      await updateRetake(editing.id, values);
-      message.success('补录条目已更新');
-    } else {
-      await putRetake(buildRow(values, 'retake'));
-      message.success('补录条目已建立');
-    }
-    setDialogOpen(false);
+  function openCreate(): void {
     setEditing(null);
-    form.resetFields();
+    setError(null);
+    const initial: Omit<Retake, 'id'> = {
+      ...createEmptyRetake(),
+      songId: songs[0]?.id ?? ''
+    };
+    setDraft(initial);
+    form.setFieldsValue(initial);
+    setDialogOpen(true);
   }
 
-  /** 由问题 Take 直接生成补录条目 */
+  function openEdit(row: RetakeRow): void {
+    setEditing(row);
+    setError(null);
+    const values: Omit<Retake, 'id'> = {
+      songId: row.songId,
+      reason: row.reason,
+      planDate: row.planDate,
+      roomNo: row.roomNo,
+      period: row.period,
+      musicians: row.musicians ?? '',
+      shortageNote: row.shortageNote ?? '',
+      state: row.state
+    };
+    setDraft(values);
+    form.setFieldsValue(values);
+    setDialogOpen(true);
+  }
+
+  async function submit(): Promise<void> {
+    const values = await form.validateFields();
+    try {
+      if (editing) {
+        const outcome = await editDraft(editing.id, values);
+        message.success(outcome.scheduled ? '补录已更新并排期' : `补录已更新，仍待排：${outcome.note}`);
+      } else {
+        const outcome = await saveDraft(values);
+        message.success(outcome.scheduled ? '补录条目已建立并排期' : `补录已记入待排：${outcome.note}`);
+      }
+      setDialogOpen(false);
+      setEditing(null);
+      form.resetFields();
+    } catch (submitError) {
+      const text = submitError instanceof Error ? submitError.message : '保存失败';
+      setError(text);
+      message.error(text);
+    }
+  }
+
+  /** 由问题 Take 直接生成补录条目（默认待安排，进页面再安排进棚） */
   async function createFromTake(take: TakeRow): Promise<void> {
     const session = sessions.find((item) => item.id === take.sessionId);
     if (!session) {
@@ -134,12 +215,16 @@ export default function RetakePlan() {
           songId: session.songId,
           reason: `${take.takeNo}（${take.startTc} → ${take.endTc}）${reasons ? `问题：${reasons}` : '评级不理想'}，需补录`,
           planDate: new Date().toISOString().slice(0, 10),
+          roomNo: 'A 棚',
+          period: '上午',
+          musicians: '',
+          shortageNote: '',
           state: '待安排'
-        } as Omit<Retake, 'id'>,
+        } satisfies Omit<Retake, 'id'>,
         'retake'
       )
     );
-    message.success('已生成补录条目');
+    message.success('已生成补录条目，请安排棚号与时段');
   }
 
   async function exportSheet(): Promise<void> {
@@ -183,7 +268,7 @@ export default function RetakePlan() {
         <div>
           <h2 className="page__title">补录计划与结构版本导出</h2>
           <p className="page__subtitle">
-            本地库 {DB_NAME}（结构版本 v{DB_SCHEMA_VERSION}）· 补录完成后自动联动曲目录制状态。
+            本地库 {DB_NAME}（结构版本 v{DB_SCHEMA_VERSION}）· 补录安排与场次共记一本棚时段账，排不下记为待排并写明差额，重开后可接着排。
           </p>
         </div>
         <Space>
@@ -193,15 +278,7 @@ export default function RetakePlan() {
           <Button type="primary" icon={<DownloadOutlined />} onClick={exportSheet}>
             导出场次记录表
           </Button>
-          <Button
-            icon={<PlusOutlined />}
-            disabled={songs.length === 0}
-            onClick={() => {
-              setEditing(null);
-              form.setFieldsValue({ ...createEmptyRetake(), songId: songs[0]?.id ?? '' });
-              setDialogOpen(true);
-            }}
-          >
+          <Button icon={<PlusOutlined />} disabled={songs.length === 0} onClick={openCreate}>
             新建补录
           </Button>
         </Space>
@@ -210,9 +287,10 @@ export default function RetakePlan() {
       <div className="badge-row">
         <StatBadge label="补录条目" value={totals.total} suffix="条" tone="primary" icon="files" />
         <StatBadge label="待处理" value={totals.pending} suffix="条" tone="warning" icon="warning" />
-        <StatBadge label="已完成" value={totals.done} suffix="条" tone="success" icon="grid" />
-        <StatBadge label="问题 Take" value={totals.problemTakes} suffix="条" tone="danger" icon="histogram" />
-        <StatBadge label="待补录时长" value={totals.openDurationText} tone="info" icon="trend" />
+        <StatBadge label="待排（差额度/席位）" value={totals.waiting} suffix="条" tone="danger" icon="histogram" />
+        <StatBadge label="已排期" value={totals.scheduled} suffix="条" tone="info" icon="grid" />
+        <StatBadge label="已完成" value={totals.done} suffix="条" tone="success" icon="trend" />
+        <StatBadge label="问题 Take" value={totals.problemTakes} suffix="条" tone="danger" icon="pie" />
       </div>
 
       {error ? <Alert type="error" showIcon message={error} closable onClose={() => setError(null)} /> : null}
@@ -226,11 +304,7 @@ export default function RetakePlan() {
                 description="从问题 Take 直接生成补录条目，或手工新建一条补录计划。"
                 showCreate={songs.length > 0}
                 createText="新建补录"
-                onCreate={() => {
-                  setEditing(null);
-                  form.setFieldsValue({ ...createEmptyRetake(), songId: songs[0]?.id ?? '' });
-                  setDialogOpen(true);
-                }}
+                onCreate={openCreate}
               />
             ) : (
               <Table<RetakeRow>
@@ -238,33 +312,78 @@ export default function RetakePlan() {
                 dataSource={scopedRetakes}
                 pagination={false}
                 columns={[
-                  { title: '曲目', minWidth: 180, render: (_, row) => songLabel(row.songId) },
-                  { title: '补录原因', dataIndex: 'reason', minWidth: 240 },
-                  { title: '计划日期', dataIndex: 'planDate', width: 120 },
+                  { title: '曲目', minWidth: 160, render: (_, row) => songLabel(row.songId) },
+                  {
+                    title: '补录原因 / 待排差额',
+                    minWidth: 240,
+                    render: (_, row) => (
+                      <Space direction="vertical" size={2}>
+                        <span>{row.reason}</span>
+                        {row.state === '待排' && row.shortageNote ? (
+                          <Typography.Text type="danger" style={{ fontSize: 12 }}>
+                            排不下：{row.shortageNote}
+                          </Typography.Text>
+                        ) : null}
+                      </Space>
+                    )
+                  },
+                  {
+                    title: '安排',
+                    width: 180,
+                    render: (_, row) => (
+                      <Space direction="vertical" size={0}>
+                        <span>
+                          {row.planDate} · {row.period}
+                          {row.period === '通宵' ? <Tag color="purple" style={{ marginInlineStart: 4 }}>占 2 份</Tag> : null}
+                        </span>
+                        <span className="muted" style={{ fontSize: 12 }}>
+                          {row.roomNo} · 乐手 {countMusicians(row.musicians ?? '')}/{getRoomConfig(row.roomNo).musicianCapacity} 席
+                        </span>
+                      </Space>
+                    )
+                  },
                   {
                     title: '状态',
                     dataIndex: 'state',
-                    width: 110,
-                    render: (value: string) => (
-                      <Tag color={value === '已完成' ? 'green' : value === '已排期' ? 'blue' : 'orange'}>{value}</Tag>
-                    )
+                    width: 100,
+                    render: (value: Retake['state']) => <Tag color={RETAKE_STATE_COLOR[value]}>{value}</Tag>
                   },
                   {
                     title: '操作',
                     width: 210,
                     render: (_, row) => (
-                      <Space>
-                        <Select
-                          size="small"
-                          style={{ width: 100 }}
-                          value={row.state}
-                          options={RETAKE_STATES.map((item) => ({ label: item, value: item }))}
-                          onChange={async (value) => {
-                            await updateRetake(row.id, { state: value as Retake['state'] });
-                            message.success('状态已更新');
-                          }}
-                        />
-                        {row.state !== '已完成' ? (
+                      <Space wrap>
+                        {row.state === '待安排' || row.state === '待排' ? (
+                          <Button
+                            type="link"
+                            size="small"
+                            onClick={async () => {
+                              const outcome = await arrange(row.id);
+                              if (outcome.scheduled) {
+                                message.success('已排进棚时段账');
+                              } else {
+                                message.warning(`仍待排：${outcome.note}`);
+                              }
+                            }}
+                          >
+                            安排
+                          </Button>
+                        ) : null}
+                        {row.state === '已排期' ? (
+                          <Popconfirm
+                            title="释放该补录安排？"
+                            description="释放后不再占用棚时段额度，可重新安排"
+                            onConfirm={async () => {
+                              await release(row.id);
+                              message.success('已释放，回到待排');
+                            }}
+                          >
+                            <Button type="link" size="small">
+                              释放
+                            </Button>
+                          </Popconfirm>
+                        ) : null}
+                        {row.state === '已排期' ? (
                           <Button
                             type="link"
                             size="small"
@@ -276,20 +395,7 @@ export default function RetakePlan() {
                             完成
                           </Button>
                         ) : null}
-                        <Button
-                          type="link"
-                          size="small"
-                          onClick={() => {
-                            setEditing(row);
-                            form.setFieldsValue({
-                              songId: row.songId,
-                              reason: row.reason,
-                              planDate: row.planDate,
-                              state: row.state
-                            });
-                            setDialogOpen(true);
-                          }}
-                        >
+                        <Button type="link" size="small" onClick={() => openEdit(row)}>
                           编辑
                         </Button>
                         <Popconfirm
@@ -407,17 +513,55 @@ export default function RetakePlan() {
         cancelText="取消"
         destroyOnClose
       >
-        <Form form={form} layout="vertical">
+        <Form form={form} layout="vertical" onValuesChange={(_, all) => setDraft(all as Omit<Retake, 'id'>)}>
           <Form.Item name="songId" label="曲目" rules={[{ required: true, message: '请选择曲目' }]}>
             <Select options={songs.map((song) => ({ label: songLabel(song.id), value: song.id }))} />
           </Form.Item>
           <Form.Item name="reason" label="补录原因" rules={[{ required: true, message: '请填写补录原因' }]}>
             <Input.TextArea rows={2} placeholder="如：T02 音准偏差，主歌需重录" />
           </Form.Item>
-          <Form.Item name="planDate" label="计划日期" rules={[{ required: true, message: '请选择计划日期' }]}>
-            <Input type="date" />
+          <Space size={12} wrap>
+            <Form.Item name="planDate" label="计划日期" rules={[{ required: true, message: '请选择计划日期' }]}>
+              <Input type="date" style={{ width: 180 }} />
+            </Form.Item>
+            <Form.Item name="period" label="时段" rules={[{ required: true }]}>
+              <Select style={{ width: 130 }} options={SESSION_PERIODS.map((item) => ({ label: item, value: item }))} />
+            </Form.Item>
+            <Form.Item name="roomNo" label="棚号" rules={[{ required: true }]}>
+              <Select style={{ width: 150 }} options={STUDIO_ROOMS.map((item) => ({ label: item, value: item }))} />
+            </Form.Item>
+          </Space>
+          <Form.Item name="musicians" label="参与乐手（顿号分隔，用于校验棚位容量）">
+            <Input placeholder="如：主唱：林拾、吉他：程野" />
           </Form.Item>
-          <Form.Item name="state" label="状态" rules={[{ required: true }]}>
+
+          {bookingPreview && bookingPreview.mode === 'booking' ? (
+            <Alert
+              style={{ marginBottom: 16 }}
+              type={bookingPreview.result.allowed ? 'info' : 'warning'}
+              showIcon
+              message={
+                bookingPreview.result.allowed
+                  ? `保存后可排进 ${draft.roomNo} ${draft.planDate}：额度剩余 ${bookingPreview.result.remaining} 份（本次占 ${bookingPreview.result.needShares} 份），棚位 ${bookingPreview.room.musicianCapacity} 席`
+                  : `账本余额不足，保存后将记为「待排」：${describeShortages(bookingPreview.result.shortages)}`
+              }
+              description={
+                <Space size={8} wrap>
+                  <Tag color={bookingPreview.result.needShares <= bookingPreview.result.remaining ? 'green' : 'red'}>
+                    额度 {bookingPreview.result.usedShares}/{bookingPreview.result.quota} 份
+                  </Tag>
+                  <Tag color={bookingPreview.musicianCount <= bookingPreview.room.musicianCapacity ? 'green' : 'red'}>
+                    乐手 {bookingPreview.musicianCount}/{bookingPreview.room.musicianCapacity} 席
+                  </Tag>
+                </Space>
+              }
+            />
+          ) : null}
+          {bookingPreview?.mode === 'done' ? (
+            <Alert style={{ marginBottom: 16 }} type="success" showIcon message="已完成的补录保持完成状态，不再参与抢账" />
+          ) : null}
+
+          <Form.Item name="state" label="状态" rules={[{ required: true }]} extra="保存时会按棚时段账本自动校验：排得下落「已排期」，排不下落「待排」。">
             <Select options={RETAKE_STATES.map((item) => ({ label: item, value: item }))} />
           </Form.Item>
         </Form>

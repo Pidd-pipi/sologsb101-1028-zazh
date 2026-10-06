@@ -1,4 +1,4 @@
-/** /sessions 场次安排与参与乐手：按日期/棚号排期并提示时段冲突 */
+/** /sessions 场次安排与参与乐手：按日期/棚号排期，走棚时段账本校验 */
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
@@ -13,6 +13,7 @@ import {
   Space,
   Table,
   Tag,
+  Typography,
   message
 } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
@@ -22,7 +23,7 @@ import EmptyPanel from '@/components/common/EmptyPanel';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useProjectStore } from '@/stores/projectStore';
-import { db, type ProjectRow, type SessionRow, type SongRow, type TakeRow } from '@/utils/db';
+import { db, type ProjectRow, type SessionRow, type SongRow, type TakeRow, type RetakeRow } from '@/utils/db';
 import {
   SESSION_PERIODS,
   SESSION_STATES,
@@ -30,8 +31,17 @@ import {
   createEmptySession,
   type Session
 } from '@/types/session';
+import { getRoomConfig } from '@/types/room';
 import type { FilterModel, FilterSelectConfig } from '@/types/filter';
 import { formatDuration, totalDuration } from '@/utils/timecode';
+import {
+  auditLedger,
+  countMusicians,
+  describeShortages,
+  evaluateBooking,
+  retakeToEntry,
+  sessionToEntry
+} from '@/utils/ledger';
 
 const asArray = (value: string | string[] | boolean | undefined): string[] => (Array.isArray(value) ? value : []);
 
@@ -41,6 +51,7 @@ export default function SessionPlan() {
   const songs = useIdbTable<SongRow>(db.songs);
   const projects = useIdbTable<ProjectRow>(db.projects);
   const takes = useIdbTable<TakeRow>(db.takes);
+  const retakes = useIdbTable<RetakeRow>(db.retakes);
 
   const filters = useSessionStore((state) => state.filters);
   const setFilters = useSessionStore((state) => state.setFilters);
@@ -55,6 +66,7 @@ export default function SessionPlan() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<SessionRow | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<Omit<Session, 'id'>>(createEmptySession());
   const [form] = Form.useForm<Omit<Session, 'id'>>();
 
   useEffect(() => {
@@ -115,18 +127,30 @@ export default function SessionPlan() {
     ? filtered.filter((session) => songOf(session.songId)?.projectId === currentProjectId)
     : filtered;
 
-  /** 棚号时段占用矩阵提示：同一棚号同一天同一时段出现多次即为冲突 */
-  const conflicts = useMemo(() => {
-    const seen = new Map<string, number>();
-    sessions.forEach((session) => {
-      if (session.state === '已取消') return;
-      const key = `${session.roomNo}|${session.date}|${session.period}`;
-      seen.set(key, (seen.get(key) ?? 0) + 1);
-    });
-    return Array.from(seen.entries())
-      .filter(([, count]) => count > 1)
-      .map(([key]) => key.replace(/\|/g, ' · '));
-  }, [sessions]);
+  /** 棚时段账本审计：场次 + 已排期补录共记一本账（撞号 / 超额 / 超席位） */
+  const ledgerIssues = useMemo(() => {
+    const entries = [...sessions.map(sessionToEntry), ...retakes.map(retakeToEntry)];
+    return auditLedger(entries);
+  }, [sessions, retakes]);
+
+  /** 表单草稿的放号预览（编辑时排除自身） */
+  const bookingPreview = useMemo(() => {
+    if (!dialogOpen) return null;
+    if (draft.state === '已取消') return { mode: 'cancelled' as const };
+    const entries = [...sessions.map(sessionToEntry), ...retakes.map(retakeToEntry)];
+    const result = evaluateBooking(
+      entries,
+      {
+        date: draft.date,
+        period: draft.period,
+        roomNo: draft.roomNo,
+        musicianCount: countMusicians(draft.musicians)
+      },
+      editing?.id ?? null
+    );
+    const room = getRoomConfig(draft.roomNo);
+    return { mode: 'booking' as const, result, room, musicianCount: countMusicians(draft.musicians) };
+  }, [dialogOpen, draft, sessions, retakes, editing]);
 
   const totals = useMemo(() => {
     const relevantTakes = takes.filter((take) =>
@@ -143,6 +167,35 @@ export default function SessionPlan() {
       durationText: formatDuration(totalDuration(relevantTakes))
     };
   }, [scopedSessions, takes]);
+
+  function openCreate(): void {
+    setEditing(null);
+    setError(null);
+    const initial: Omit<Session, 'id'> = {
+      ...createEmptySession(),
+      songId: songs.find((song) => song.projectId === currentProjectId)?.id ?? songs[0]?.id ?? ''
+    };
+    setDraft(initial);
+    form.setFieldsValue(initial);
+    setDialogOpen(true);
+  }
+
+  function openEdit(row: SessionRow): void {
+    setEditing(row);
+    setError(null);
+    const values: Omit<Session, 'id'> = {
+      songId: row.songId,
+      date: row.date,
+      period: row.period,
+      engineer: row.engineer,
+      roomNo: row.roomNo,
+      musicians: row.musicians,
+      state: row.state
+    };
+    setDraft(values);
+    form.setFieldsValue(values);
+    setDialogOpen(true);
+  }
 
   async function submit(): Promise<void> {
     const values = await form.validateFields();
@@ -170,22 +223,11 @@ export default function SessionPlan() {
       <div className="page__head">
         <div>
           <h2 className="page__title">场次安排与参与乐手</h2>
-          <p className="page__subtitle">同一棚号同一天同一时段只允许一场；冲突会被拦截并提示占用场次。</p>
+          <p className="page__subtitle">
+            每个棚记一本当日额度账：同棚同时段只放一个号，通宵占 2 份额度，乐手人数超过棚位容量直接拒绝；补录安排共记这本账。
+          </p>
         </div>
-        <Button
-          type="primary"
-          icon={<PlusOutlined />}
-          disabled={songs.length === 0}
-          onClick={() => {
-            setEditing(null);
-            setError(null);
-            form.setFieldsValue({
-              ...createEmptySession(),
-              songId: songs.find((song) => song.projectId === currentProjectId)?.id ?? songs[0]?.id ?? ''
-            });
-            setDialogOpen(true);
-          }}
-        >
+        <Button type="primary" icon={<PlusOutlined />} disabled={songs.length === 0} onClick={openCreate}>
           新增场次
         </Button>
       </div>
@@ -198,12 +240,12 @@ export default function SessionPlan() {
         <StatBadge label="已录时长" value={totals.durationText} tone="danger" icon="pie" />
       </div>
 
-      {conflicts.length > 0 ? (
+      {ledgerIssues.length > 0 ? (
         <Alert
           type="warning"
           showIcon
-          message={`检测到 ${conflicts.length} 处棚号时段占用冲突`}
-          description={conflicts.join('；')}
+          message={`棚时段账本存在 ${ledgerIssues.length} 处超额/撞号`}
+          description={ledgerIssues.map((issue) => issue.detail).join('；')}
         />
       ) : null}
 
@@ -226,11 +268,7 @@ export default function SessionPlan() {
           description="为曲目安排录制场次，填写棚号、时段、录音师与参与乐手。"
           createText="新增场次"
           showCreate={songs.length > 0}
-          onCreate={() => {
-            setEditing(null);
-            form.setFieldsValue(createEmptySession());
-            setDialogOpen(true);
-          }}
+          onCreate={openCreate}
         />
       ) : (
         <Card title={`场次清单（${scopedSessions.length}）`}>
@@ -251,11 +289,42 @@ export default function SessionPlan() {
                   </div>
                 )
               },
-              { title: '日期', dataIndex: 'date', width: 120 },
-              { title: '时段', dataIndex: 'period', width: 90 },
+              {
+                title: '日期',
+                dataIndex: 'date',
+                width: 120
+              },
+              {
+                title: '时段',
+                dataIndex: 'period',
+                width: 100,
+                render: (value: Session['period']) => (
+                  <Space size={4}>
+                    {value}
+                    {value === '通宵' ? <Tag color="purple">占 2 份</Tag> : null}
+                  </Space>
+                )
+              },
               { title: '棚号', dataIndex: 'roomNo', width: 100 },
               { title: '录音师', dataIndex: 'engineer', width: 100 },
-              { title: '参与乐手', dataIndex: 'musicians', minWidth: 200 },
+              {
+                title: '参与乐手',
+                dataIndex: 'musicians',
+                minWidth: 200,
+                render: (value: string, row) => {
+                  const over = countMusicians(value) > getRoomConfig(row.roomNo).musicianCapacity;
+                  return (
+                    <Space size={4}>
+                      <span>{value}</span>
+                      {over ? (
+                        <Tag color="red">
+                          {countMusicians(value)}/{getRoomConfig(row.roomNo).musicianCapacity} 席
+                        </Tag>
+                      ) : null}
+                    </Space>
+                  );
+                }
+              },
               {
                 title: '状态',
                 dataIndex: 'state',
@@ -274,24 +343,7 @@ export default function SessionPlan() {
                 width: 170,
                 render: (_, row) => (
                   <Space onClick={(event) => event.stopPropagation()}>
-                    <Button
-                      type="link"
-                      size="small"
-                      onClick={() => {
-                        setEditing(row);
-                        setError(null);
-                        form.setFieldsValue({
-                          songId: row.songId,
-                          date: row.date,
-                          period: row.period,
-                          engineer: row.engineer,
-                          roomNo: row.roomNo,
-                          musicians: row.musicians,
-                          state: row.state
-                        });
-                        setDialogOpen(true);
-                      }}
-                    >
+                    <Button type="link" size="small" onClick={() => openEdit(row)}>
                       编辑
                     </Button>
                     <Popconfirm
@@ -323,7 +375,11 @@ export default function SessionPlan() {
         cancelText="取消"
         destroyOnClose
       >
-        <Form form={form} layout="vertical">
+        <Form
+          form={form}
+          layout="vertical"
+          onValuesChange={(_, all) => setDraft(all as Omit<Session, 'id'>)}
+        >
           <Form.Item name="songId" label="曲目" rules={[{ required: true, message: '请选择曲目' }]}>
             <Select
               showSearch
@@ -334,7 +390,7 @@ export default function SessionPlan() {
               }))}
             />
           </Form.Item>
-          <Space size={12}>
+          <Space size={12} wrap>
             <Form.Item name="date" label="日期" rules={[{ required: true, message: '请选择日期' }]}>
               <Input type="date" style={{ width: 180 }} />
             </Form.Item>
@@ -345,6 +401,33 @@ export default function SessionPlan() {
               <Select style={{ width: 160 }} options={STUDIO_ROOMS.map((item) => ({ label: item, value: item }))} />
             </Form.Item>
           </Space>
+
+          {bookingPreview && bookingPreview.mode === 'booking' ? (
+            <Alert
+              style={{ marginBottom: 16 }}
+              type={bookingPreview.result.allowed ? 'info' : 'error'}
+              showIcon
+              message={
+                bookingPreview.result.allowed
+                  ? `${draft.roomNo} ${draft.date}：额度剩余 ${bookingPreview.result.remaining} 份（本次占 ${bookingPreview.result.needShares} 份，通宵 2 份），棚位 ${bookingPreview.room.musicianCapacity} 席`
+                  : `本次放号会被拒绝：${describeShortages(bookingPreview.result.shortages)}`
+              }
+              description={
+                <Space size={8} wrap>
+                  <Tag color={bookingPreview.result.needShares <= bookingPreview.result.remaining ? 'green' : 'red'}>
+                    额度 {bookingPreview.result.usedShares}/{bookingPreview.result.quota} 份
+                  </Tag>
+                  <Tag color={bookingPreview.musicianCount <= bookingPreview.room.musicianCapacity ? 'green' : 'red'}>
+                    乐手 {bookingPreview.musicianCount}/{bookingPreview.room.musicianCapacity} 席
+                  </Tag>
+                </Space>
+              }
+            />
+          ) : null}
+          {bookingPreview?.mode === 'cancelled' ? (
+            <Alert style={{ marginBottom: 16 }} type="warning" showIcon message="已取消的场次不占用棚时段额度" />
+          ) : null}
+
           <Form.Item name="engineer" label="录音师" rules={[{ required: true, message: '请填写录音师' }]}>
             <Input placeholder="如：赵鸣" />
           </Form.Item>
@@ -354,6 +437,10 @@ export default function SessionPlan() {
           <Form.Item name="state" label="场次状态" rules={[{ required: true }]}>
             <Select options={SESSION_STATES.map((item) => ({ label: item, value: item }))} />
           </Form.Item>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            放号规则：同天同棚同一时段仅放 1 个号；每日总额度 {getRoomConfig(draft.roomNo).dailyQuota} 份（上午/下午/晚上各 1
+            份，通宵 2 份）；乐手人数超过 {getRoomConfig(draft.roomNo).musicianCapacity} 席拒绝放号。
+          </Typography.Text>
         </Form>
       </Modal>
     </div>

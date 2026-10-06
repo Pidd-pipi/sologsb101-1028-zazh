@@ -1,25 +1,34 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据库名 gbstudiotake-db，数据结构版本号 version(1) 与 upgrade() 迁移逻辑
+ * - 数据库名 gbstudiotake-db，数据结构版本号与 upgrade() 迁移逻辑
  * - 项目 / 曲目 / 场次 / Take / 优选 / 补录 六张表分表存储
  * - 首次打开自动播种互相引用的演示数据，保证每个页面打开都有内容
  */
 import Dexie, { type Table } from 'dexie';
 import type { Project } from '../types/project';
 import type { Song } from '../types/song';
-import type { Session } from '../types/session';
+import type { Session, SessionPeriod } from '../types/session';
 import type { Take } from '../types/take';
 import type { Pick } from '../types/pick';
-import type { Retake } from '../types/retake';
+import type { Retake, RetakeState } from '../types/retake';
+import { normalizeRetake } from '../types/retake';
 import { nowIso } from './uuid';
 import { seedDatabase } from './seed';
 import { ROW_REVISION } from './revision';
+import {
+  countMusicians,
+  describeShortages,
+  evaluateBooking,
+  retakeToEntry,
+  sessionToEntry,
+  type BookingEntry
+} from './ledger';
 
 /** 数据库名 */
 export const DB_NAME = 'gbstudiotake-db';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 1;
+export const DB_SCHEMA_VERSION = 2;
 
 /** 行结构修订号（定义在叶子模块 ./revision，避免与 ./seed 形成循环依赖） */
 export { ROW_REVISION };
@@ -48,7 +57,7 @@ export class GbStudioTakeDatabase extends Dexie {
   constructor() {
     super(DB_NAME);
 
-    this.version(DB_SCHEMA_VERSION)
+    this.version(1)
       .stores({
         projects: 'id, name, client, state, startDate, updatedAt',
         songs: 'id, projectId, title, arrangement, state, updatedAt',
@@ -58,7 +67,7 @@ export class GbStudioTakeDatabase extends Dexie {
         retakes: 'id, songId, planDate, state, updatedAt'
       })
       .upgrade(async (tx) => {
-        // 结构迁移：为历史行补齐行修订号与时间戳；新建库时各表为空，迁移天然幂等
+        // v1 结构迁移：为历史行补齐行修订号与时间戳；新建库时各表为空，迁移天然幂等
         const tableNames = ['projects', 'songs', 'sessions', 'takes', 'picks', 'retakes'];
         for (const name of tableNames) {
           await tx
@@ -68,6 +77,56 @@ export class GbStudioTakeDatabase extends Dexie {
               row.revision = ROW_REVISION;
               if (typeof row.createdAt !== 'number') row.createdAt = Date.now();
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt;
+            });
+        }
+      });
+
+    // v2：补录计划补上棚号 / 时段 / 乐手 / 待排差额，与场次共用一本棚时段账
+    this.version(2)
+      .stores({
+        retakes: 'id, songId, planDate, roomNo, period, state, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const sessions = (await tx.table('sessions').toArray()) as SessionRow[];
+        const retakes = (await tx.table('retakes').toArray()) as RetakeRow[];
+
+        // 1) 为缺棚号 / 时段的旧补录计划补字段
+        retakes.forEach((retake) => {
+          if (typeof retake.roomNo !== 'string' || retake.roomNo.length === 0) retake.roomNo = 'A 棚';
+          if (!retake.period) retake.period = '上午' as SessionPeriod;
+          if (typeof retake.musicians !== 'string') retake.musicians = '';
+          if (typeof retake.shortageNote !== 'string') retake.shortageNote = '';
+        });
+
+        // 2) 与场次对同一本账：排不下的旧「已排期」补录降级为「待排」并写清差额
+        const entries: BookingEntry[] = sessions.map(sessionToEntry);
+        retakes.forEach((retake) => {
+          if (retake.state !== '已排期') return;
+          const result = evaluateBooking(entries, {
+            date: retake.planDate,
+            period: retake.period,
+            roomNo: retake.roomNo,
+            musicianCount: countMusicians(retake.musicians ?? '')
+          });
+          if (result.allowed) {
+            entries.push(retakeToEntry(retake));
+          } else {
+            retake.state = '待排' as RetakeState;
+            retake.shortageNote = describeShortages(result.shortages);
+          }
+        });
+
+        await tx.table('retakes').clear();
+        await tx.table('retakes').bulkPut(retakes);
+
+        // 3) 行修订号升到 v2
+        const tableNames = ['projects', 'songs', 'sessions', 'takes', 'picks', 'retakes'];
+        for (const name of tableNames) {
+          await tx
+            .table(name)
+            .toCollection()
+            .modify((row: Record<string, unknown>) => {
+              row.revision = ROW_REVISION;
             });
         }
       });
@@ -158,26 +217,18 @@ export async function putSession(row: SessionRow): Promise<void> {
   await db.sessions.put(row);
 }
 
+export async function getSession(id: string): Promise<SessionRow | undefined> {
+  return db.sessions.get(id);
+}
+
 export async function updateSession(id: string, patch: Partial<Session>): Promise<void> {
   await db.sessions.update(id, { ...patch, updatedAt: Date.now() } as never);
 }
 
-/**
- * 校验棚号时段冲突：同一棚号同一日期同一时段只能有一场（已取消的除外）
- * @param selfId 编辑自身时排除
- */
-export async function findRoomConflict(
-  roomNo: string,
-  date: string,
-  period: string,
-  selfId: string | null
-): Promise<SessionRow | null> {
-  const rows = await db.sessions
-    .where('roomNo')
-    .equals(roomNo)
-    .filter((item) => item.date === date && item.period === period && item.state !== '已取消' && item.id !== selfId)
-    .toArray();
-  return rows[0] ?? null;
+/** 组装当前账本全部占有条目：有效场次 + 已排期补录，二者抢同一本账 */
+export async function listBookingEntries(): Promise<BookingEntry[]> {
+  const [sessions, retakes] = await Promise.all([db.sessions.toArray(), db.retakes.toArray()]);
+  return [...sessions.map(sessionToEntry), ...retakes.map(retakeToEntry)];
 }
 
 /** 删除场次：级联删除其 Take 与对应优选 */
@@ -271,6 +322,44 @@ export async function updateRetake(id: string, patch: Partial<Retake>): Promise<
   await db.retakes.update(id, { ...patch, updatedAt: Date.now() } as never);
 }
 
+/**
+ * 尝试把补录排进棚时段账本：
+ * - 排得下 → state='已排期' 并清空待排差额；
+ * - 排不下 → state='待排' 并写清差多少（不占额度，重开后可再排）。
+ */
+export async function arrangeRetake(id: string): Promise<{ scheduled: boolean; note: string }> {
+  return db.transaction('rw', [db.retakes, db.sessions], async () => {
+    const retake = await db.retakes.get(id);
+    if (!retake) throw new Error('补录条目不存在');
+    if (retake.state === '已完成') return { scheduled: true, note: '补录已完成' };
+
+    const [sessions, retakes] = await Promise.all([db.sessions.toArray(), db.retakes.toArray()]);
+    const entries: BookingEntry[] = [
+      ...sessions.map(sessionToEntry),
+      ...retakes.filter((item) => item.id !== id).map(retakeToEntry)
+    ];
+    const result = evaluateBooking(entries, {
+      date: retake.planDate,
+      period: retake.period,
+      roomNo: retake.roomNo,
+      musicianCount: countMusicians(retake.musicians ?? '')
+    });
+
+    if (result.allowed) {
+      await db.retakes.update(id, { state: '已排期', shortageNote: '', updatedAt: Date.now() } as never);
+      return { scheduled: true, note: '已排进棚时段账' };
+    }
+    const note = describeShortages(result.shortages);
+    await db.retakes.update(id, { state: '待排', shortageNote: note, updatedAt: Date.now() } as never);
+    return { scheduled: false, note };
+  });
+}
+
+/** 释放已排期的补录安排：退回待排（不占额度），可重新安排 */
+export async function releaseRetake(id: string): Promise<void> {
+  await db.retakes.update(id, { state: '待排', shortageNote: '', updatedAt: Date.now() } as never);
+}
+
 /** 补录完成：联动曲目状态 */
 export async function completeRetake(id: string): Promise<void> {
   await db.transaction('rw', [db.retakes, db.songs], async () => {
@@ -339,7 +428,32 @@ function stamp<T>(row: T): T & Revisioned {
   return { ...row, revision: ROW_REVISION, createdAt: now, updatedAt: now };
 }
 
+/**
+ * 导入整库备份：
+ * - v1 备份的补录缺棚号 / 时段，先归一补齐；
+ * - 归一后再与场次对同一本账，排不下的补录降级为「待排」并写清差额。
+ */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
+  const sessions = snapshot.sessions;
+  const retakes = snapshot.retakes.map((retake) => normalizeRetake(retake) as Retake);
+
+  const entries: BookingEntry[] = sessions.map(sessionToEntry);
+  retakes.forEach((retake) => {
+    if (retake.state !== '已排期') return;
+    const result = evaluateBooking(entries, {
+      date: retake.planDate,
+      period: retake.period,
+      roomNo: retake.roomNo,
+      musicianCount: countMusicians(retake.musicians)
+    });
+    if (result.allowed) {
+      entries.push(retakeToEntry(retake));
+    } else {
+      retake.state = '待排';
+      retake.shortageNote = describeShortages(result.shortages);
+    }
+  });
+
   await db.transaction('rw', [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes], async () => {
     await Promise.all([
       db.projects.clear(),
@@ -351,10 +465,10 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     ]);
     await db.projects.bulkPut(snapshot.projects.map(stamp));
     await db.songs.bulkPut(snapshot.songs.map(stamp));
-    await db.sessions.bulkPut(snapshot.sessions.map(stamp));
+    await db.sessions.bulkPut(sessions.map(stamp));
     await db.takes.bulkPut(snapshot.takes.map(stamp));
     await db.picks.bulkPut(snapshot.picks.map(stamp));
-    await db.retakes.bulkPut(snapshot.retakes.map(stamp));
+    await db.retakes.bulkPut(retakes.map(stamp));
   });
 }
 

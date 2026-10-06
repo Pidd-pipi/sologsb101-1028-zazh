@@ -17,6 +17,14 @@ import type {
   RetakeRow
 } from './db';
 import { ROW_REVISION } from './revision';
+import {
+  countMusicians,
+  describeShortages,
+  evaluateBooking,
+  retakeToEntry,
+  sessionToEntry,
+  type BookingEntry
+} from './ledger';
 
 function rev<T>(row: T): T & { revision: number; createdAt: number; updatedAt: number } {
   const now = Date.now();
@@ -40,7 +48,10 @@ const SESSIONS: Array<Omit<SessionRow, 'revision' | 'createdAt' | 'updatedAt'>> 
   { id: 'ss-001', songId: 'sg-001', date: '2024-03-12', period: '上午', engineer: '赵鸣', roomNo: 'A 棚', musicians: '鼓：许峰、贝斯：黎川、吉他：程野', state: '已完成' },
   { id: 'ss-002', songId: 'sg-001', date: '2024-03-13', period: '下午', engineer: '赵鸣', roomNo: 'A 棚', musicians: '弦乐四重奏', state: '已完成' },
   { id: 'ss-003', songId: 'sg-002', date: '2024-03-20', period: '晚上', engineer: '何笙', roomNo: 'B 棚', musicians: '大提琴：闻州', state: '已排期' },
-  { id: 'ss-004', songId: 'sg-003', date: '2024-03-18', period: '上午', engineer: '赵鸣', roomNo: 'C 棚', musicians: '钢琴：苏禾', state: '已完成' }
+  { id: 'ss-004', songId: 'sg-003', date: '2024-03-18', period: '上午', engineer: '赵鸣', roomNo: 'C 棚', musicians: '钢琴：苏禾', state: '已完成' },
+  // 2024-03-25 的 A 棚：上午、下午两场占 2 份，通宵补录需 2 份 → 只差 1 份（记待排）
+  { id: 'ss-005', songId: 'sg-002', date: '2024-03-25', period: '上午', engineer: '何笙', roomNo: 'A 棚', musicians: '小提琴：闻溪、中提琴：闻州', state: '已排期' },
+  { id: 'ss-006', songId: 'sg-001', date: '2024-03-25', period: '下午', engineer: '赵鸣', roomNo: 'A 棚', musicians: '吉他：程野', state: '已排期' }
 ];
 
 const TAKES: Array<Omit<TakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
@@ -59,12 +70,77 @@ const PICKS: Array<Omit<PickRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
 ];
 
 const RETAKES: Array<Omit<RetakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
-  { id: 'rt-001', songId: 'sg-001', reason: 'T02 音准偏差，主歌需重录', planDate: '2024-03-25', state: '已排期' },
-  { id: 'rt-002', songId: 'sg-003', reason: '踏板噪声偏大，需重录第二段', planDate: '2024-03-27', state: '待安排' }
+  {
+    id: 'rt-001',
+    songId: 'sg-001',
+    reason: 'T02 音准偏差，主歌需重录',
+    planDate: '2024-03-28',
+    roomNo: 'B 棚',
+    period: '下午',
+    musicians: '主唱：林拾',
+    shortageNote: '',
+    state: '已排期'
+  },
+  {
+    id: 'rt-002',
+    songId: 'sg-003',
+    reason: '踏板噪声偏大，需重录第二段',
+    planDate: '2024-03-27',
+    roomNo: 'A 棚',
+    period: '上午',
+    musicians: '钢琴：苏禾',
+    shortageNote: '',
+    state: '待安排'
+  }
 ];
+
+/** 待排演示条目：A 棚 2024-03-25 已占 2 份，通宵需 2 份，只差 1 份，记待排 */
+function buildPendingRetake(): Omit<RetakeRow, 'revision' | 'createdAt' | 'updatedAt'> {
+  const pending = {
+    id: 'rt-003',
+    songId: 'sg-002',
+    reason: '夜航弦乐群戏情绪不足，需通宵重录整段',
+    planDate: '2024-03-25',
+    roomNo: 'A 棚',
+    period: '通宵' as const,
+    musicians: '小提琴：闻溪、中提琴：闻州、大提琴：闻州',
+    shortageNote: '',
+    state: '待排' as const
+  };
+  const entries: BookingEntry[] = SESSIONS.map((session) => sessionToEntry(session));
+  const result = evaluateBooking(entries, {
+    date: pending.planDate,
+    period: pending.period,
+    roomNo: pending.roomNo,
+    musicianCount: countMusicians(pending.musicians)
+  });
+  return { ...pending, shortageNote: result.allowed ? '' : describeShortages(result.shortages) };
+}
 
 /** 灌入演示数据（项目 → 曲目 → 场次 → Take → 优选 / 补录）；目标库由调用方传入，避免反向 import */
 export async function seedDatabase(target: GbStudioTakeDatabase): Promise<void> {
+  // 已排期补录也需过一遍账本，排不下则记待排，保证演示数据自身账本自洽
+  const entries: BookingEntry[] = SESSIONS.map((session) => sessionToEntry(session));
+  const seededRetakes: Array<Omit<RetakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [];
+  for (const retake of [...RETAKES, buildPendingRetake()]) {
+    if (retake.state === '已排期') {
+      const result = evaluateBooking(entries, {
+        date: retake.planDate,
+        period: retake.period,
+        roomNo: retake.roomNo,
+        musicianCount: countMusicians(retake.musicians)
+      });
+      if (result.allowed) {
+        entries.push(retakeToEntry(retake));
+        seededRetakes.push(retake);
+      } else {
+        seededRetakes.push({ ...retake, state: '待排', shortageNote: describeShortages(result.shortages) });
+      }
+    } else {
+      seededRetakes.push(retake);
+    }
+  }
+
   await target.transaction(
     'rw',
     [target.projects, target.songs, target.sessions, target.takes, target.picks, target.retakes],
@@ -74,7 +150,7 @@ export async function seedDatabase(target: GbStudioTakeDatabase): Promise<void> 
       await target.sessions.bulkPut(SESSIONS.map(rev));
       await target.takes.bulkPut(TAKES.map(rev));
       await target.picks.bulkPut(PICKS.map(rev));
-      await target.retakes.bulkPut(RETAKES.map(rev));
+      await target.retakes.bulkPut(seededRetakes.map(rev));
     }
   );
 }
