@@ -22,14 +22,17 @@ import EmptyPanel from '@/components/common/EmptyPanel';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useProjectStore } from '@/stores/projectStore';
-import { db, type ProjectRow, type SessionRow, type SongRow, type TakeRow } from '@/utils/db';
+import { db, type ProjectRow, type RetakeRow, type SessionRow, type SongRow, type TakeRow } from '@/utils/db';
 import {
   SESSION_PERIODS,
   SESSION_STATES,
   STUDIO_ROOMS,
+  countMusicians,
   createEmptySession,
+  studioRoomConfig,
   type Session
 } from '@/types/session';
+import { buildRoomDayLedger } from '@/utils/ledger';
 import type { FilterModel, FilterSelectConfig } from '@/types/filter';
 import { formatDuration, totalDuration } from '@/utils/timecode';
 
@@ -41,6 +44,7 @@ export default function SessionPlan() {
   const songs = useIdbTable<SongRow>(db.songs);
   const projects = useIdbTable<ProjectRow>(db.projects);
   const takes = useIdbTable<TakeRow>(db.takes);
+  const retakes = useIdbTable<RetakeRow>(db.retakes);
 
   const filters = useSessionStore((state) => state.filters);
   const setFilters = useSessionStore((state) => state.setFilters);
@@ -128,6 +132,23 @@ export default function SessionPlan() {
       .map(([key]) => key.replace(/\|/g, ' · '));
   }, [sessions]);
 
+  /** 棚位台账：每个棚每天一本账，场次与已排期补录抢同一本账（口径见 utils/ledger） */
+  const ledgers = useMemo(() => {
+    const keys = new Set<string>();
+    sessions.forEach((session) => {
+      if (session.state !== '已取消') keys.add(`${session.roomNo}|${session.date}`);
+    });
+    retakes.forEach((retake) => {
+      if (retake.state === '已排期' || retake.state === '已完成') keys.add(`${retake.roomNo}|${retake.planDate}`);
+    });
+    return Array.from(keys)
+      .map((key) => {
+        const [roomNo, date] = key.split('|');
+        return buildRoomDayLedger(roomNo, date, sessions, retakes);
+      })
+      .sort((a, b) => a.date.localeCompare(b.date) || a.roomNo.localeCompare(b.roomNo));
+  }, [sessions, retakes]);
+
   const totals = useMemo(() => {
     const relevantTakes = takes.filter((take) =>
       scopedSessions.map((session) => session.id).includes(take.sessionId)
@@ -136,10 +157,7 @@ export default function SessionPlan() {
       sessionCount: scopedSessions.length,
       scheduled: scopedSessions.filter((item) => item.state === '已排期').length,
       done: scopedSessions.filter((item) => item.state === '已完成').length,
-      musicianSlots: scopedSessions.reduce(
-        (sum, item) => sum + item.musicians.split(/[、,，]/).filter((name) => name.trim().length > 0).length,
-        0
-      ),
+      musicianSlots: scopedSessions.reduce((sum, item) => sum + countMusicians(item.musicians), 0),
       durationText: formatDuration(totalDuration(relevantTakes))
     };
   }, [scopedSessions, takes]);
@@ -170,7 +188,9 @@ export default function SessionPlan() {
       <div className="page__head">
         <div>
           <h2 className="page__title">场次安排与参与乐手</h2>
-          <p className="page__subtitle">同一棚号同一天同一时段只允许一场；冲突会被拦截并提示占用场次。</p>
+          <p className="page__subtitle">
+            每个棚每天一本账：普通时段占 1 份额度、通宵占 2 份，额度用完不放号；乐手人数超过棚位容量即拒绝排号；补录与场次抢同一本账。
+          </p>
         </div>
         <Button
           type="primary"
@@ -219,6 +239,46 @@ export default function SessionPlan() {
           setSearchParams({}, { replace: true });
         }}
       />
+
+      {ledgers.length > 0 ? (
+        <Card title={`棚位台账（${ledgers.length}）`} size="small" style={{ marginBottom: 16 }}>
+          <Table
+            rowKey={(row) => `${row.roomNo}|${row.date}`}
+            dataSource={ledgers}
+            pagination={false}
+            size="small"
+            columns={[
+              { title: '棚号', dataIndex: 'roomNo', width: 100 },
+              { title: '日期', dataIndex: 'date', width: 120 },
+              {
+                title: '棚位容量',
+                width: 100,
+                render: (_, row) => `${studioRoomConfig(row.roomNo).capacity} 人`
+              },
+              {
+                title: '时段额度',
+                width: 110,
+                render: (_, row) => `${row.used} / ${row.quota} 份`
+              },
+              {
+                title: '剩余',
+                width: 90,
+                render: (_, row) => (
+                  <Tag color={row.remaining < 0 ? 'red' : row.remaining === 0 ? 'volcano' : row.remaining === 1 ? 'orange' : 'green'}>
+                    {row.remaining < 0 ? `超额 ${-row.remaining} 份` : `剩 ${row.remaining} 份`}
+                  </Tag>
+                )
+              },
+              {
+                title: '占用明细',
+                minWidth: 240,
+                render: (_, row) =>
+                  row.entries.map((entry) => `${entry.kind}·${entry.period}${entry.weight > 1 ? '（2 份）' : ''}`).join('、')
+              }
+            ]}
+          />
+        </Card>
+      ) : null}
 
       {scopedSessions.length === 0 ? (
         <EmptyPanel

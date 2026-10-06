@@ -1,10 +1,12 @@
 /**
- * 场次 store：维护场次排期、棚号占用校验与筛选条件。
+ * 场次 store：维护场次排期、棚位账本校验与筛选条件。
+ * 排号规则集中在 utils/ledger：同时段冲突、棚位容量、当日时段额度任一不过即拒绝。
  */
 import { create } from 'zustand';
 import type { FilterModel } from '@/types/filter';
-import type { Session } from '@/types/session';
-import { findRoomConflict, putSession, removeSession, updateSession } from '@/utils/db';
+import type { Session, SessionPeriod } from '@/types/session';
+import { getRoomDayLoad, getSession, putSession, removeSession, updateSession } from '@/utils/db';
+import { checkSessionPlacement } from '@/utils/ledger';
 import { buildRow } from '@/hooks/useIdbTable';
 
 export const SESSION_FILTER_KEYS = ['rooms', 'periods', 'states'];
@@ -18,7 +20,11 @@ interface SessionState {
   createSession: (payload: Omit<Session, 'id'>) => Promise<string>;
   editSession: (id: string, patch: Partial<Session>) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
-  assertRoomFree: (roomNo: string, date: string, period: string, selfId: string | null) => Promise<void>;
+  /** 校验场次能否排入棚位账本（时段冲突 / 容量 / 额度），排不下抛出写明差多少的错误 */
+  assertSessionPlacable: (
+    payload: { roomNo: string; date: string; period: SessionPeriod; musicians: string },
+    selfId: string | null
+  ) => Promise<void>;
 }
 
 export const useSessionStore = create<SessionState>()((set, get) => ({
@@ -27,25 +33,35 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   setFilters: (next) => set({ filters: next }),
   resetFilters: () => set({ filters: { keyword: '', rooms: [], periods: [], states: [] } }),
   selectSession: (id) => set({ currentSessionId: id }),
-  assertRoomFree: async (roomNo, date, period, selfId) => {
-    const conflict = await findRoomConflict(roomNo, date, period, selfId);
-    if (conflict) {
-      throw new Error(`${roomNo} 在 ${date} ${period} 已被场次占用（场次 ${conflict.id}），请换棚或换时段`);
+  assertSessionPlacable: async (payload, selfId) => {
+    const { sessions, retakes } = await getRoomDayLoad(payload.roomNo, payload.date);
+    const check = checkSessionPlacement({ ...payload, sessions, retakes, selfId });
+    if (!check.ok) {
+      throw new Error(check.reason);
     }
   },
   createSession: async (payload) => {
-    await get().assertRoomFree(payload.roomNo, payload.date, payload.period, null);
+    if (payload.state !== '已取消') {
+      await get().assertSessionPlacable(payload, null);
+    }
     const row = buildRow(payload, 'session');
     await putSession(row);
     set({ currentSessionId: row.id });
     return row.id;
   },
   editSession: async (id, patch) => {
-    const current = { ...patch } as Partial<Session>;
-    if (patch.roomNo && patch.date && patch.period) {
-      await get().assertRoomFree(patch.roomNo, patch.date, patch.period, id);
+    const current = await getSession(id);
+    if (!current) {
+      throw new Error('场次不存在');
     }
-    await updateSession(id, current);
+    const merged = { ...current, ...patch };
+    if (merged.state !== '已取消') {
+      await get().assertSessionPlacable(
+        { roomNo: merged.roomNo, date: merged.date, period: merged.period, musicians: merged.musicians },
+        id
+      );
+    }
+    await updateSession(id, { ...patch });
   },
   deleteSession: async (id) => {
     await removeSession(id);

@@ -8,6 +8,7 @@ import Dexie, { type Table } from 'dexie';
 import type { Project } from '../types/project';
 import type { Song } from '../types/song';
 import type { Session } from '../types/session';
+import { STUDIO_ROOMS } from '../types/session';
 import type { Take } from '../types/take';
 import type { Pick } from '../types/pick';
 import type { Retake } from '../types/retake';
@@ -19,7 +20,7 @@ import { ROW_REVISION } from './revision';
 export const DB_NAME = 'gbstudiotake-db';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 1;
+export const DB_SCHEMA_VERSION = 2;
 
 /** 行结构修订号（定义在叶子模块 ./revision，避免与 ./seed 形成循环依赖） */
 export { ROW_REVISION };
@@ -48,7 +49,7 @@ export class GbStudioTakeDatabase extends Dexie {
   constructor() {
     super(DB_NAME);
 
-    this.version(DB_SCHEMA_VERSION)
+    this.version(1)
       .stores({
         projects: 'id, name, client, state, startDate, updatedAt',
         songs: 'id, projectId, title, arrangement, state, updatedAt',
@@ -58,7 +59,7 @@ export class GbStudioTakeDatabase extends Dexie {
         retakes: 'id, songId, planDate, state, updatedAt'
       })
       .upgrade(async (tx) => {
-        // 结构迁移：为历史行补齐行修订号与时间戳；新建库时各表为空，迁移天然幂等
+        // 结构迁移 v1：为历史行补齐行修订号与时间戳；新建库时各表为空，迁移天然幂等
         const tableNames = ['projects', 'songs', 'sessions', 'takes', 'picks', 'retakes'];
         for (const name of tableNames) {
           await tx
@@ -70,6 +71,29 @@ export class GbStudioTakeDatabase extends Dexie {
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt;
             });
         }
+      });
+
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        projects: 'id, name, client, state, startDate, updatedAt',
+        songs: 'id, projectId, title, arrangement, state, updatedAt',
+        sessions: 'id, songId, date, period, roomNo, engineer, state, updatedAt',
+        takes: 'id, sessionId, takeNo, grade, startTc, updatedAt',
+        picks: 'id, takeId, usage, order, updatedAt',
+        retakes: 'id, songId, planDate, roomNo, state, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 结构迁移 v2：补录计划加入棚位账本——为只有计划日期的历史补录行
+        // 补上棚号与时段（默认首个棚 + 上午），并初始化排号说明字段
+        await tx
+          .table('retakes')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.roomNo !== 'string' || row.roomNo === '') row.roomNo = STUDIO_ROOMS[0];
+            if (typeof row.period !== 'string' || row.period === '') row.period = '上午';
+            if (typeof row.shortfall !== 'string') row.shortfall = '';
+            row.revision = ROW_REVISION;
+          });
       });
   }
 }
@@ -162,22 +186,28 @@ export async function updateSession(id: string, patch: Partial<Session>): Promis
   await db.sessions.update(id, { ...patch, updatedAt: Date.now() } as never);
 }
 
+export async function getSession(id: string): Promise<SessionRow | undefined> {
+  return db.sessions.get(id);
+}
+
 /**
- * 校验棚号时段冲突：同一棚号同一日期同一时段只能有一场（已取消的除外）
- * @param selfId 编辑自身时排除
+ * 读取某天某棚的全部账本相关行（场次 + 补录，不做状态过滤）。
+ * 占用口径（未取消场次、已排期/已完成补录）统一由 utils/ledger 判定。
  */
-export async function findRoomConflict(
-  roomNo: string,
-  date: string,
-  period: string,
-  selfId: string | null
-): Promise<SessionRow | null> {
-  const rows = await db.sessions
-    .where('roomNo')
-    .equals(roomNo)
-    .filter((item) => item.date === date && item.period === period && item.state !== '已取消' && item.id !== selfId)
-    .toArray();
-  return rows[0] ?? null;
+export async function getRoomDayLoad(roomNo: string, date: string): Promise<{ sessions: SessionRow[]; retakes: RetakeRow[] }> {
+  const [sessions, retakes] = await Promise.all([
+    db.sessions
+      .where('roomNo')
+      .equals(roomNo)
+      .filter((item) => item.date === date)
+      .toArray(),
+    db.retakes
+      .where('roomNo')
+      .equals(roomNo)
+      .filter((item) => item.planDate === date)
+      .toArray()
+  ]);
+  return { sessions, retakes };
 }
 
 /** 删除场次：级联删除其 Take 与对应优选 */
@@ -263,6 +293,9 @@ export async function listRetakes(): Promise<RetakeRow[]> {
   return rows.sort((a, b) => a.planDate.localeCompare(b.planDate));
 }
 
+export async function getRetake(id: string): Promise<RetakeRow | undefined> {
+  return db.retakes.get(id);
+}
 export async function putRetake(row: RetakeRow): Promise<void> {
   await db.retakes.put(row);
 }
@@ -339,6 +372,17 @@ function stamp<T>(row: T): T & Revisioned {
   return { ...row, revision: ROW_REVISION, createdAt: now, updatedAt: now };
 }
 
+/** 兼容 v1 旧备份：补录行缺棚号 / 时段 / 排号说明时补默认值（与 upgrade 迁移同口径） */
+function normalizeRetake(row: Retake): Retake {
+  const raw = row as unknown as Record<string, unknown>;
+  return {
+    ...row,
+    roomNo: typeof raw.roomNo === 'string' && raw.roomNo !== '' ? raw.roomNo : STUDIO_ROOMS[0],
+    period: typeof raw.period === 'string' && raw.period !== '' ? (raw.period as Retake['period']) : '上午',
+    shortfall: typeof raw.shortfall === 'string' ? raw.shortfall : ''
+  };
+}
+
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction('rw', [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes], async () => {
     await Promise.all([
@@ -354,7 +398,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.sessions.bulkPut(snapshot.sessions.map(stamp));
     await db.takes.bulkPut(snapshot.takes.map(stamp));
     await db.picks.bulkPut(snapshot.picks.map(stamp));
-    await db.retakes.bulkPut(snapshot.retakes.map(stamp));
+    await db.retakes.bulkPut(snapshot.retakes.map((row) => stamp(normalizeRetake(row))));
   });
 }
 

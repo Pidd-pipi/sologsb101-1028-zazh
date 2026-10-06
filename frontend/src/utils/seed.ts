@@ -59,8 +59,8 @@ const PICKS: Array<Omit<PickRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
 ];
 
 const RETAKES: Array<Omit<RetakeRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
-  { id: 'rt-001', songId: 'sg-001', reason: 'T02 音准偏差，主歌需重录', planDate: '2024-03-25', state: '已排期' },
-  { id: 'rt-002', songId: 'sg-003', reason: '踏板噪声偏大，需重录第二段', planDate: '2024-03-27', state: '待安排' }
+  { id: 'rt-001', songId: 'sg-001', reason: 'T02 音准偏差，主歌需重录', planDate: '2024-03-25', roomNo: 'A 棚', period: '下午', state: '已排期', shortfall: '' },
+  { id: 'rt-002', songId: 'sg-003', reason: '踏板噪声偏大，需重录第二段', planDate: '2024-03-27', roomNo: 'C 棚', period: '上午', state: '待安排', shortfall: '' }
 ];
 
 /** 灌入演示数据（项目 → 曲目 → 场次 → Take → 优选 / 补录）；目标库由调用方传入，避免反向 import */
